@@ -19,6 +19,22 @@
 #include <pcl/pcl_macros.h>
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/segmentation/extract_clusters.h>
+#include "pcl/common/io.h"
+#include <pcl/kdtree/impl/kdtree_flann.hpp>
+#include <pcl/features/impl/normal_3d.hpp>
+#include <pcl/search/impl/organized.hpp>
+#include <pcl/filters/statistical_outlier_removal.h>
+#include <pcl/features/normal_3d_omp.h>
+
+//point type must be set at compile time
+#define USE_COLOR true
+#if USE_COLOR
+	  typedef typename pcl::PointXYZRGBA pcl_point_t;
+	  bool color=true;
+#else
+	  typedef typename pcl::PointXYZ pcl_point_t;
+	  bool color=false;
+#endif
 
 #include <boost/filesystem/convenience.hpp>
 #include <boost/filesystem.hpp>
@@ -66,19 +82,19 @@ meshToFaceCloud (const pcl::PolygonMesh &mesh)
   return (cloud);
 }
 
-void
+template <typename PointT> void
 flattenVertices (pcl::PolygonMesh &mesh, float min_dist = 0.0001)
 {
-  pcl::PointCloud<pcl::PointXYZ>::Ptr vertices (new pcl::PointCloud<pcl::PointXYZ>);
+  typename pcl::PointCloud<PointT>::Ptr vertices (new pcl::PointCloud<PointT>);
   pcl::fromPCLPointCloud2 (mesh.cloud, *vertices);
-  pcl::search::KdTree<pcl::PointXYZ> vert_tree (true);
+  pcl::search::KdTree<PointT> vert_tree (true);
   vert_tree.setInputCloud (vertices);
   // Find duplicates
   std::vector<int> vertex_remap (vertices->size (), -1);
   int idx = 0;
   std::vector<int> neighbors;
   std::vector<float> dists;
-  pcl::PointCloud<pcl::PointXYZ> vertices_new;
+  pcl::PointCloud<PointT> vertices_new;
   for (size_t i = 0; i < vertices->size (); i++)
   {
     if (vertex_remap[i] >= 0)
@@ -115,7 +131,43 @@ flattenVertices (pcl::PolygonMesh &mesh, float min_dist = 0.0001)
   pcl::toPCLPointCloud2 (vertices_new, mesh.cloud);
 }
 
-void
+template <typename PointT> void
+computeNormals (pcl::PointCloud<PointT> &cloud, pcl::PointCloud<pcl::Normal> &normals)
+{
+	  typename pcl::PointCloud<PointT>::Ptr cloud_no_nans (new pcl::PointCloud<PointT> ());
+	  std::vector<int> indexes;
+	  pcl::removeNaNFromPointCloud(cloud,*cloud_no_nans,indexes);
+
+	  // Create the normal estimation class, and pass the input dataset to it
+	  typename pcl::NormalEstimationOMP<PointT, pcl::Normal> ne;
+	  ne.setInputCloud (cloud_no_nans);
+
+	  // Create an empty kdtree representation, and pass it to the normal estimation object.
+	  // Its content will be filled inside the object, based on the given input dataset (as no other search surface is given).
+	  typename pcl::search::KdTree<PointT>::Ptr tree (new pcl::search::KdTree<PointT> ());
+	  ne.setSearchMethod (tree);
+
+	  // Output datasets
+	  pcl::PointCloud<pcl::Normal>::Ptr cloud_normals (new pcl::PointCloud<pcl::Normal>);
+
+	  // Use all neighbors in a sphere of radius 3cm
+	  ne.setRadiusSearch (0.03);
+
+	  // Compute the features
+	  ne.compute (*cloud_normals);
+
+	  normals.points.clear();
+	  normals.width=cloud.width;
+	  normals.height=cloud.height;
+	  pcl::Normal nan_normal(NAN,NAN,NAN);
+	  normals.points.resize(normals.width*normals.height,nan_normal);
+
+	  for (int i = 0; i < cloud_normals->points.size(); ++i) {
+		  normals.points.at(indexes[i])=cloud_normals->points.at(i);
+	}
+}
+
+template <typename PointT> void
 cleanupMesh (pcl::PolygonMesh &mesh, float face_dist=0.02, int min_neighbors=5)
 {
   // Remove faces which aren't within 2 marching cube widths from any others
@@ -148,7 +200,7 @@ cleanupMesh (pcl::PolygonMesh &mesh, float face_dist=0.02, int min_neighbors=5)
     mesh.polygons.erase (mesh.polygons.begin () + faces_to_remove[i]);
   }
   // Remove all vertices with no face
-  pcl::PointCloud<pcl::PointXYZ> vertices;
+  pcl::PointCloud<PointT> vertices;
   pcl::fromPCLPointCloud2 (mesh.cloud, vertices);
   std::vector<bool> has_face (vertices.size (), false);
   for (size_t i = 0; i < mesh.polygons.size (); i++)
@@ -158,7 +210,7 @@ cleanupMesh (pcl::PolygonMesh &mesh, float face_dist=0.02, int min_neighbors=5)
     has_face[v.vertices[1]] = true;
     has_face[v.vertices[2]] = true;
   }
-  pcl::PointCloud<pcl::PointXYZ> vertices_new;
+  pcl::PointCloud<PointT> vertices_new;
   std::vector<size_t> get_new_idx (vertices.size ());
   size_t cur_idx = 0;
   for (size_t i = 0; i <vertices.size (); i++)
@@ -179,8 +231,8 @@ cleanupMesh (pcl::PolygonMesh &mesh, float face_dist=0.02, int min_neighbors=5)
   pcl::toPCLPointCloud2 (vertices_new, mesh.cloud);
 }
 
-bool
-reprojectPoint (const pcl::PointXYZRGBA &pt, int &u, int &v)
+template <typename PointT> bool
+reprojectPoint (const PointT &pt, int &u, int &v)
 {
   u = (pt.x * focal_length_x_ / pt.z) + principal_point_x_;
   v = (pt.y * focal_length_y_ / pt.z) + principal_point_y_;
@@ -218,6 +270,7 @@ main (int argc, char** argv)
     ("cx", bpo::value<float> (), "Center pixel x")
     ("cy", bpo::value<float> (), "Center pixel y")
     ("save-ascii", "Save ply file as ASCII rather than binary")
+    ("normals", "Compute normals")
     ("cloud-units", bpo::value<float> (), "Units of the data, in meters")
     ("pose-units", bpo::value<float> (), "Units of the poses, in meters")
     ("max-sensor-dist", bpo::value<float> (), "Maximum distance data can be from the sensor")
@@ -249,6 +302,7 @@ main (int argc, char** argv)
   bool world_frame = opts.count ("world");
   bool zero_nans = opts.count ("zero-nans");
   bool save_ascii = opts.count ("save-ascii");
+  bool compute_normals = opts.count ("normals");
   float cloud_units = 1.;
   if (opts.count ("cloud-units"))
     cloud_units = opts["cloud-units"].as<float> ();
@@ -380,10 +434,11 @@ main (int argc, char** argv)
     tsdf->setCameraIntrinsics (focal_length_x_, focal_length_y_, principal_point_x_, principal_point_y_);
     tsdf->setNumRandomSplts (num_random_splits);
     tsdf->setSensorDistanceBounds (min_sensor_dist, max_sensor_dist);
+    tsdf->setIntegrateColor(color);
     tsdf->reset ();
   }
   // Load data
-  pcl::PointCloud<pcl::PointXYZRGBA>::Ptr map (new pcl::PointCloud<pcl::PointXYZRGBA>);
+  pcl::PointCloud<pcl_point_t>::Ptr map (new pcl::PointCloud<pcl_point_t>);
   // Set up visualization
   pcl::visualization::PCLVisualizer::Ptr vis;
   if (visualize)
@@ -393,25 +448,28 @@ main (int argc, char** argv)
   } 
   
   // Initialize aggregate cloud if we are just doing that instead
-  pcl::PointCloud<pcl::PointXYZRGBA>::Ptr aggregate;
+  pcl::PointCloud<pcl_point_t>::Ptr aggregate;
   if (cloud_only)
-    aggregate.reset (new pcl::PointCloud<pcl::PointXYZRGBA>);
+    aggregate.reset (new pcl::PointCloud<pcl_point_t>);
   size_t num_frames = pcd_files.size ();
   for (size_t i = 0; i < num_frames; i++)
   {
     PCL_INFO ("On frame %d / %d\n", i+1, num_frames);
     PCL_INFO ("Cloud: %s, pose: %s\n", 
         pcd_files[i].c_str (), pose_files[i].c_str ());
-    pcl::PointCloud<pcl::PointXYZRGBA>::Ptr cloud (new pcl::PointCloud<pcl::PointXYZRGBA>);
+    pcl::PointCloud<pcl_point_t>::Ptr cloud (new pcl::PointCloud<pcl_point_t>);
     pcl::io::loadPCDFile (pcd_files[i], *cloud);
     if (cloud_units != 1)
     {
-      for (size_t i = 0; i < cloud->size (); i++)
+      for (size_t j = 0; j < cloud->size (); j++)
       {
-        pcl::PointXYZRGBA &pt = cloud->at (i);
+        pcl_point_t &pt = cloud->at (j);
         pt.x *= cloud_units;
         pt.y *= cloud_units;
         pt.z *= cloud_units;
+        //set the transparency to 1 as this is not done by the PCL in some cases when exporting RGB clouds
+        if(color)
+          pt.a = 1;
       }
     }
     // Remove nans
@@ -423,11 +481,16 @@ main (int argc, char** argv)
           cloud->at (j).x = cloud->at (j).y = cloud->at (j).z = std::numeric_limits<float>::quiet_NaN ();
       }
     }
+	//compute the normals
+    pcl::PointCloud<pcl::Normal>::Ptr normals (new pcl::PointCloud<pcl::Normal>);
+	if(compute_normals){      
+      computeNormals<pcl_point_t> (*cloud, *normals );
+	}
     // Transform
     if (world_frame)
       pcl::transformPointCloud (*cloud, *cloud, poses[i].inverse ());
     // Make organized
-    pcl::PointCloud<pcl::PointXYZRGBA>::Ptr cloud_organized (new pcl::PointCloud<pcl::PointXYZRGBA> (width_, height_));
+    pcl::PointCloud<pcl_point_t>::Ptr cloud_organized (new pcl::PointCloud<pcl_point_t> (width_, height_));
     if (organized)
     {
       if (cloud->height != height_ || cloud->width != width_)
@@ -451,13 +514,13 @@ main (int argc, char** argv)
         cloud_organized->at (j).z = std::numeric_limits<float>::quiet_NaN ();
       for (size_t j = 0; j < cloud->size (); j++)
       {
-        const pcl::PointXYZRGBA &pt = cloud->at (j);
+        const pcl_point_t &pt = cloud->at (j);
         if (verbose && !pcl_isnan (pt.z))
           nonnan_original++;
         int u, v;
         if (reprojectPoint (pt, u, v))
         {
-          pcl::PointXYZRGBA &pt_old = (*cloud_organized) (u, v);
+          pcl_point_t &pt_old = (*cloud_organized) (u, v);
           if (pcl_isnan (pt_old.z) || (pt_old.z > pt.z))
           {
             if (verbose)
@@ -472,6 +535,14 @@ main (int argc, char** argv)
               if (pt.z > max_z) max_z = pt.z;
             }
             pt_old = pt;
+			if(compute_normals)
+		    {
+			  const pcl::Normal &pt_normal = normals->at (j);
+		      pcl::Normal &pt_normal_old = (*normals) (u, v);
+		      pt_normal_old = pt_normal;
+		      std::cout << pt_normal.normal_x << " " << pt_normal.normal_y << " " << pt_normal.normal_z << std::endl;
+		      std::cout << pt_normal_old.normal_x << " " << pt_normal_old.normal_y << " " << pt_normal_old.normal_z << std::endl;
+		    }
           }
         }
       }
@@ -484,10 +555,10 @@ main (int argc, char** argv)
     if (visualize) // Just for visualization purposes
     {
       vis->removeAllPointClouds ();
-      pcl::PointCloud<pcl::PointXYZRGBA> cloud_trans;
+      pcl::PointCloud<pcl_point_t> cloud_trans;
       pcl::transformPointCloud (*cloud_organized, cloud_trans, poses[i]);
       *map += cloud_trans;
-      pcl::visualization::PointCloudColorHandlerCustom<pcl::PointXYZRGBA> map_handler (map, 255, 0, 0);
+      pcl::visualization::PointCloudColorHandlerCustom<pcl_point_t> map_handler (map, 255, 0, 0);
       vis->addPointCloud (map, map_handler, "map");
       PCL_INFO ("Map\n");
       vis->spin ();
@@ -496,7 +567,7 @@ main (int argc, char** argv)
     Eigen::Affine3d  pose_rel_to_first_frame = poses[0].inverse () * poses[i];
     if (cloud_only) // Only if we're just dumping out the cloud
     {
-      pcl::PointCloud<pcl::PointXYZRGBA> cloud_unorganized;
+      pcl::PointCloud<pcl_point_t> cloud_unorganized;
       for (size_t i = 0; i < cloud_organized->size (); i++)
       {
         if (!pcl_isnan (cloud_organized->at (i).z))
@@ -507,7 +578,7 @@ main (int argc, char** argv)
       // Filter so it doesn't get too big
       if (i % 20 == 0 || i == num_frames - 1)
       {
-        pcl::VoxelGrid<pcl::PointXYZRGBA> vg;
+        pcl::VoxelGrid<pcl_point_t> vg;
         vg.setLeafSize (0.01, 0.01, 0.01);
         vg.setInputCloud (aggregate);
         vg.filter (cloud_unorganized);
@@ -516,7 +587,10 @@ main (int argc, char** argv)
     }
     else
     {
-      tsdf->integrateCloud (*cloud_organized, pcl::PointCloud<pcl::Normal> (), pose_rel_to_first_frame);
+	  if(compute_normals)
+        tsdf->integrateCloud (*cloud_organized, *normals, pose_rel_to_first_frame);
+	  else
+        tsdf->integrateCloud (*cloud_organized, pcl::PointCloud<pcl::Normal> (), pose_rel_to_first_frame);
     }
   }
   // Save
@@ -532,11 +606,12 @@ main (int argc, char** argv)
     mc.setMinWeight (min_weight);
     mc.setInputTSDF (tsdf);
     pcl::PolygonMesh::Ptr mesh (new pcl::PolygonMesh);
+    mc.setColorByRGB(color);
     mc.reconstruct (*mesh);
     if (flatten)
-      flattenVertices (*mesh);
+      flattenVertices<pcl_point_t> (*mesh);
     if (cleanup)
-      cleanupMesh (*mesh);
+      cleanupMesh<pcl_point_t> (*mesh);
     PCL_INFO ("Entire pipeline took %f ms\n", tt.toc ());
     if (save_ascii)
       pcl::io::savePLYFile (out_dir + "/mesh.ply", *mesh);
